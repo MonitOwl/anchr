@@ -1,0 +1,73 @@
+# Build directory - contains all compiled objects and executables
+build/
+# Compiled kernel modules
+*.ko
+*.mod.c
+*.mod.o
+*.o
+*.mod
+!go.mod
+
+# Kernel build system files (in case they end up in root)
+*.cmd
+.tmp_versions/
+
+vmlinux.h
+include-vmlinux/
+log.txt
+
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+**/bin/*
+
+# Editor temporary files
+*~
+*.swp
+*.swo
+.*.swp
+.*.swo
+*.patch
+*.pdf
+out.txt
+*.out
+
+# Compressed folders
+*.tgz
+
+# Test binary, built with `go test -c`
+*.test
+
+# IDE files
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Backup files
+*.backup
+*.bak
+
+# Log files
+*.log
+
+# Core dumps
+core.*
+
+# Temporary files
+*.tmp
+*tmp
+
+
+# Go workspace file
+go.work

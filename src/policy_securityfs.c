@@ -1,0 +1,635 @@
+/**
+ * policy_securityfs.c - SecurityFS interface for policy updates
+ *
+ * This file provides a userspace interface to update policies via securityfs.
+ * 
+ * GLOBAL POLICY:
+ *   /sys/kernel/security/anchr/policy
+ *   - Sets default policy for all namespaces
+ *   - New namespaces inherit from global policy
+ *
+ * PER-NAMESPACE POLICY:
+ *   /sys/kernel/security/anchr/namespaces/<namespace_id>/policy
+ *   - Overrides global policy for specific namespace
+ *   - Fine-grained control per container
+ * 
+ * Write format: "field=value"
+ * Examples:
+ *   echo "filter_flags=0x7" > policy
+ *   echo "action_flags=0x3F" > policy
+ *   echo "min_file_size=10485760" > policy
+ *   echo "log_level=3" > policy
+ */
+
+#include "anchr_common.h"
+#include "anchr_policy.h"
+#include "anchr_securityfs.h"
+#include <linux/capability.h>
+
+/* Module parameter to control policy write access */
+static int securityfs_policy_writable = 1;
+module_param(securityfs_policy_writable, int, 0444);
+MODULE_PARM_DESC(securityfs_policy_writable,
+                 "Allow runtime policy modifications via securityfs (0=read-only, 1=writable). "
+                 "SECURITY: Set to 0 in production to prevent policy tampering.");
+
+static struct dentry *global_policy_file;
+static struct dentry *policy_map_file;
+static struct dentry *policy_apply_file;
+
+ssize_t global_policy_write(struct file *file, const char __user *user_buf, size_t count, loff_t *ppos);
+ssize_t policy_update_write(struct file *file, const char __user *user_buf, size_t count, loff_t *ppos);
+
+static int parse_and_update_policy(const char *buf, const char *namespace_id)
+{
+    char *copy = kstrdup(buf, GFP_KERNEL), *value;
+    u32 number;
+    int ret;
+
+    if (!copy)
+        return -ENOMEM;
+    value = strchr(copy, '=');
+    if (!value) {
+        kfree(copy);
+        return -EINVAL;
+    }
+    *value++ = '\0';
+    ret = kstrtou32(value, 0, &number);
+    if (!ret)
+        ret = anchr_policy_update_field(namespace_id, copy, number);
+    kfree(copy);
+    return ret;
+}
+
+static ssize_t policy_map_write(struct file *file, const char __user *buffer, size_t count, loff_t *pos)
+{
+    char text[32];
+    u32 fd;
+    int ret;
+
+    if (!capable(CAP_SYS_ADMIN))
+        return -EPERM;
+    if (!count || count >= sizeof(text))
+        return -EINVAL;
+    if (copy_from_user(text, buffer, count))
+        return -EFAULT;
+    text[count] = '\0';
+    if (memchr(text, '\0', count))
+        return -EINVAL;
+    ret = kstrtou32(text, 0, &fd);
+    if (!ret)
+        ret = anchr_policy_bind_map(fd);
+    return ret ? ret : count;
+}
+
+static ssize_t policy_apply_write(struct file *file, const char __user *buffer, size_t count, loff_t *pos)
+{
+    struct anchr_policy_request *request;
+    struct anchr_policy_config *config;
+    int ret;
+
+    if (!securityfs_policy_writable || !capable(CAP_SYS_ADMIN))
+        return -EPERM;
+    if (count != sizeof(*request))
+        return -EINVAL;
+    request = memdup_user(buffer, count);
+    if (IS_ERR(request))
+        return PTR_ERR(request);
+    request->version = le32_to_cpu(request->version);
+    request->reserved = le32_to_cpu(request->reserved);
+    request->expected_generation = le64_to_cpu(request->expected_generation);
+    config = &request->record.snapshot.config;
+    config->filter_flags = le32_to_cpu(config->filter_flags);
+    config->action_flags = le32_to_cpu(config->action_flags);
+    config->min_file_size = le32_to_cpu(config->min_file_size);
+    config->max_path_depth = le32_to_cpu(config->max_path_depth);
+    config->log_level = le32_to_cpu(config->log_level);
+    config->merkle_history_max_size = le32_to_cpu(config->merkle_history_max_size);
+    for (int i = 0; i < HOOK_MAX; i++) {
+        struct anchr_hook_config *hook = &request->record.snapshot.hooks[i];
+        hook->flags = le32_to_cpu(hook->flags);
+        hook->filter_override = le32_to_cpu(hook->filter_override);
+        hook->action_override = le32_to_cpu(hook->action_override);
+    }
+    ret = anchr_policy_apply(request);
+    kfree(request);
+    return ret ? ret : count;
+}
+
+static const struct file_operations policy_map_fops = {
+    .owner = THIS_MODULE,
+    .write = policy_map_write,
+    .open = nonseekable_open,
+};
+
+static const struct file_operations policy_apply_fops = {
+    .owner = THIS_MODULE,
+    .write = policy_apply_write,
+    .open = nonseekable_open,
+};
+
+/**
+ * policy_update_write - Handle writes to policy file (namespace-specific)
+ * @file: File being written to
+ * @user_buf: User buffer containing the write data
+ * @count: Number of bytes to write
+ * @ppos: File position
+ *
+ * Accepts commands in format "field=value" to update policies.
+ *
+ * Returns: Number of bytes written on success, negative error code on failure
+ */
+
+ssize_t policy_update_write(struct file *file, const char __user *user_buf,
+                                   size_t count, loff_t *ppos)
+{
+    char *buf;
+    char *namespace_id;
+    int ret;
+
+    if (!securityfs_policy_writable)
+        return -EPERM;
+    if (count > 256)
+        return -EINVAL;
+
+    buf = kmalloc(count + 1, GFP_KERNEL);
+    if (!buf)
+        return -ENOMEM;
+
+    if (copy_from_user(buf, user_buf, count)) {
+        kfree(buf);
+        return -EFAULT;
+    }
+    buf[count] = '\0';
+
+    if (count > 0 && buf[count - 1] == '\n')
+        buf[count - 1] = '\0';
+
+    namespace_id = file->f_inode->i_private;
+    if (!namespace_id) {
+        pr_err("anchr: No namespace_id in policy file\n");
+        kfree(buf);
+        return -EINVAL;
+    }
+
+    ret = parse_and_update_policy(buf, namespace_id);
+    kfree(buf);
+    
+    return ret < 0 ? ret : count;
+}
+
+/**
+ * global_policy_write - Handle writes to global policy file
+ * @file: File being written to
+ * @user_buf: User buffer containing the write data
+ * @count: Number of bytes to write
+ * @ppos: File position
+ *
+ * Updates the global/default policy configuration.
+ *
+ * Returns: Number of bytes written on success, negative error code on failure
+ */
+ssize_t global_policy_write(struct file *file, const char __user *user_buf,
+                                    size_t count, loff_t *ppos)
+{
+    char *buf;
+    int ret;
+
+    if (!securityfs_policy_writable)
+        return -EPERM;
+    if (count > 256)
+        return -EINVAL;
+
+    buf = kmalloc(count + 1, GFP_KERNEL);
+    if (!buf)
+        return -ENOMEM;
+
+    if (copy_from_user(buf, user_buf, count)) {
+        kfree(buf);
+        return -EFAULT;
+    }
+    buf[count] = '\0';
+
+    if (count > 0 && buf[count - 1] == '\n')
+        buf[count - 1] = '\0';
+
+    ret = parse_and_update_policy(buf, NULL);
+    kfree(buf);
+    
+    return ret < 0 ? ret : count;
+}
+
+/**
+ * policy_show - Display current policy configuration
+ * @s: seq_file structure for output
+ * @v: Unused
+ *
+ * Shows current policy settings and changes hash for the namespace.
+ */
+static int policy_show(struct seq_file *s, void *v)
+{
+    const char *id = s->private;
+    struct anchr_policy_config config;
+    struct anchr_policy_namespace *metadata;
+    u64 generation;
+    int ret;
+
+    if (!id)
+        return -EINVAL;
+    mutex_lock(&anchr_policy_namespace_mutex);
+    ret = anchr_policy_read_locked(id, &config, &generation);
+    if (ret)
+        goto unlock;
+    metadata = anchr_policy_namespace_get_locked(id);
+    if (IS_ERR(metadata)) {
+        ret = PTR_ERR(metadata);
+        goto unlock;
+    }
+    seq_printf(s, "namespace_id=%s\ngeneration=%llu\n", id, generation);
+    seq_printf(s, "filter_flags=0x%x\naction_flags=0x%x\n", config.filter_flags, config.action_flags);
+    seq_printf(s, "min_file_size=%u\nlog_level=%u\nenabled=%u\n", config.min_file_size, config.log_level, config.enabled);
+    seq_printf(s, "changes=%s\nchanges_hash=%*phN\n", metadata->changes_str,
+               MERKLE_HASH_SIZE, metadata->changes_hash);
+unlock:
+    mutex_unlock(&anchr_policy_namespace_mutex);
+    return ret;
+}
+
+/**
+ * global_policy_show - Display global policy configuration
+ * @s: seq_file structure for output
+ * @v: Unused
+ *
+ * Shows current global/default policy settings.
+ */
+static int global_policy_show(struct seq_file *s, void *v)
+{
+    struct anchr_policy_config config;
+    struct anchr_policy_config *policy = &config;
+    u64 generation;
+    mutex_lock(&anchr_policy_namespace_mutex);
+    int ret = anchr_policy_read_locked(NULL, policy, &generation);
+    mutex_unlock(&anchr_policy_namespace_mutex);
+    if (ret)
+        return ret;
+    seq_printf(s, "generation=%llu\n", generation);
+    seq_printf(s, "enabled=%u\n", policy->enabled);
+    seq_printf(s, "filter_flags=0x%x\n", policy->filter_flags);
+    seq_printf(s, "action_flags=0x%x\n", policy->action_flags);
+    seq_printf(s, "min_file_size=%u\n", policy->min_file_size);
+    seq_printf(s, "max_path_depth=%u\n", policy->max_path_depth);
+    seq_printf(s, "log_level=%u\n", policy->log_level);
+
+    return 0;
+}
+
+static int global_policy_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, global_policy_show, NULL);
+}
+
+const struct file_operations global_policy_fops = {
+    .owner = THIS_MODULE,
+    .open = global_policy_open,
+    .read = seq_read,
+    .write = global_policy_write,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
+/**
+ * global_policy_changes_show - Display global policy change history
+ * @s: seq_file structure for output
+ * @v: Unused
+ *
+ * Shows all global policy changes with format: HASH POLICY_STRING per line
+ */
+static int global_policy_changes_show(struct seq_file *s, void *v)
+{
+    struct policy_change_entry *change;
+    struct list_head *history;
+    spinlock_t *history_lock;
+    unsigned long flags;
+    int i;
+
+    history = anchr_global_policy_get_history();
+    history_lock = anchr_global_policy_get_history_lock();
+
+    spin_lock_irqsave(history_lock, flags);
+    list_for_each_entry(change, history, list) {
+        for (i = 0; i < MERKLE_HASH_SIZE; i++)
+            seq_printf(s, "%02x", change->change_hash[i]);
+        
+        seq_printf(s, " %s\n", change->policy_string);
+    }
+    spin_unlock_irqrestore(history_lock, flags);
+
+    return 0;
+}
+
+static int global_policy_changes_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, global_policy_changes_show, NULL);
+}
+
+const struct file_operations global_policy_changes_fops = {
+    .owner = THIS_MODULE,
+    .open = global_policy_changes_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
+static int policy_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, policy_show, inode->i_private);
+}
+
+const struct file_operations policy_fops = {
+    .owner = THIS_MODULE,
+    .open = policy_open,
+    .read = seq_read,
+    .write = policy_update_write,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
+/**
+ * policy_changes_show - Display policy change history for a namespace
+ * @s: seq_file structure for output
+ * @v: Unused
+ *
+ * Shows all policy changes with format: HASH POLICY_STRING per line
+ */
+static int policy_changes_show(struct seq_file *s, void *v)
+{
+    char *namespace_id = s->private;
+    struct anchr_policy_namespace *policy_ns;
+    struct policy_change_entry *change;
+    unsigned long flags;
+    int i;
+
+    if (!namespace_id)
+        return -EINVAL;
+
+    policy_ns = anchr_policy_namespace_get_or_create(namespace_id);
+    if (IS_ERR(policy_ns))
+        return PTR_ERR(policy_ns);
+
+    spin_lock_irqsave(&policy_ns->change_history_lock, flags);
+    list_for_each_entry(change, &policy_ns->change_history, list) {
+        for (i = 0; i < MERKLE_HASH_SIZE; i++)
+            seq_printf(s, "%02x", change->change_hash[i]);
+        
+        seq_printf(s, " %s\n", change->policy_string);
+    }
+    spin_unlock_irqrestore(&policy_ns->change_history_lock, flags);
+
+    return 0;
+}
+
+static int policy_changes_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, policy_changes_show, inode->i_private);
+}
+
+const struct file_operations policy_changes_fops = {
+    .owner = THIS_MODULE,
+    .open = policy_changes_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
+/**
+ * create_namespace_policy_securityfs - Create policy files for a namespace
+ * @namespace_id: Namespace identifier
+ * @parent_dir: Parent securityfs directory
+ *
+ * Creates a "policy" file in the namespace directory that can be read to
+ * show current policy and written to update policy.
+ *
+ * Returns: Pointer to policy file dentry, or ERR_PTR on failure
+ */
+struct dentry *create_namespace_policy_securityfs(const char *namespace_id,
+                                                   struct dentry *parent_dir)
+{
+    struct dentry *policy_file;
+    char *ns_copy;
+    umode_t mode;
+
+    if (!namespace_id || !parent_dir)
+        return ERR_PTR(-EINVAL);
+
+    ns_copy = kstrdup(namespace_id, GFP_KERNEL);
+    if (!ns_copy)
+        return ERR_PTR(-ENOMEM);
+
+    /* Set permissions based on module parameter */
+    mode = securityfs_policy_writable ? 0600 : 0400;
+
+    policy_file = securityfs_create_file("policy", mode, parent_dir,
+                                        ns_copy, &policy_fops);
+    if (IS_ERR(policy_file)) {
+        pr_err("anchr: Failed to create policy file for %s: %ld\n",
+               namespace_id, PTR_ERR(policy_file));
+        kfree(ns_copy);
+        return policy_file;
+    }
+
+    pr_info("anchr: Created policy interface for namespace %s (mode: %o)\n",
+            namespace_id, mode);
+    return policy_file;
+}
+
+/**
+ * remove_namespace_policy_securityfs - Remove policy file for a namespace
+ * @policy_file: Dentry of the policy file to remove
+ *
+ * Removes the policy file and frees the associated namespace_id copy.
+ */
+void remove_namespace_policy_securityfs(struct dentry *policy_file)
+{
+    void *ns_copy;
+
+    if (!policy_file || IS_ERR(policy_file))
+        return;
+
+    if (policy_file->d_inode) {
+        ns_copy = policy_file->d_inode->i_private;
+        kfree(ns_copy);
+    }
+
+    securityfs_remove(policy_file);
+}
+
+/**
+ * create_namespace_policy_changes_securityfs - Create policy_changes file for a namespace
+ * @namespace_id: Namespace identifier
+ * @parent_dir: Parent securityfs directory
+ *
+ * Creates a "policy_changes" file in the namespace directory that shows
+ * the history of all policy changes with hash and policy string per line.
+ *
+ * Returns: Pointer to policy_changes file dentry, or ERR_PTR on failure
+ */
+struct dentry *create_namespace_policy_changes_securityfs(const char *namespace_id,
+                                                          struct dentry *parent_dir)
+{
+    struct dentry *policy_changes_file;
+    char *ns_copy;
+
+    if (!namespace_id || !parent_dir)
+        return ERR_PTR(-EINVAL);
+
+    ns_copy = kstrdup(namespace_id, GFP_KERNEL);
+    if (!ns_copy)
+        return ERR_PTR(-ENOMEM);
+
+    policy_changes_file = securityfs_create_file("policy_changes", 0444, parent_dir,
+                                                 ns_copy, &policy_changes_fops);
+    if (IS_ERR(policy_changes_file)) {
+        pr_err("anchr: Failed to create policy_changes file for %s: %ld\n",
+               namespace_id, PTR_ERR(policy_changes_file));
+        kfree(ns_copy);
+        return policy_changes_file;
+    }
+
+    pr_info("anchr: Created policy_changes interface for namespace %s\n", namespace_id);
+    return policy_changes_file;
+}
+
+/**
+ * remove_namespace_policy_changes_securityfs - Remove policy_changes file for a namespace
+ * @policy_changes_file: Dentry of the policy_changes file to remove
+ *
+ * Removes the policy_changes file and frees the associated namespace_id copy.
+ */
+void remove_namespace_policy_changes_securityfs(struct dentry *policy_changes_file)
+{
+    void *ns_copy;
+
+    if (!policy_changes_file || IS_ERR(policy_changes_file))
+        return;
+
+    if (policy_changes_file->d_inode) {
+        ns_copy = policy_changes_file->d_inode->i_private;
+        kfree(ns_copy);
+    }
+
+    securityfs_remove(policy_changes_file);
+}
+
+/**
+ * create_global_policy_securityfs - Create global policy file
+ * @parent_dir: Parent securityfs directory (anchr root)
+ *
+ * Creates /sys/kernel/security/anchr/policy for global policy configuration.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+int create_global_policy_securityfs(struct dentry *parent_dir)
+{
+    umode_t mode;
+
+    if (!parent_dir)
+        return -EINVAL;
+
+    /* Set permissions based on module parameter */
+    mode = securityfs_policy_writable ? 0600 : 0400;
+
+    global_policy_file = securityfs_create_file("policy", mode, parent_dir,
+                                                NULL, &global_policy_fops);
+    if (IS_ERR(global_policy_file)) {
+        pr_err("anchr: Failed to create global policy file: %ld\n",
+               PTR_ERR(global_policy_file));
+        return PTR_ERR(global_policy_file);
+    }
+
+    policy_map_file = securityfs_create_file("policy_map", 0600, parent_dir, NULL, &policy_map_fops);
+    if (IS_ERR(policy_map_file)) {
+        int ret = PTR_ERR(policy_map_file);
+        policy_map_file = NULL;
+        remove_global_policy_securityfs();
+        return ret;
+    }
+    policy_apply_file = securityfs_create_file("policy_apply", mode, parent_dir, NULL, &policy_apply_fops);
+    if (IS_ERR(policy_apply_file)) {
+        int ret = PTR_ERR(policy_apply_file);
+        policy_apply_file = NULL;
+        remove_global_policy_securityfs();
+        return ret;
+    }
+
+    if (!securityfs_policy_writable) {
+        pr_warn("anchr: Policy files are READ-ONLY (securityfs_policy_writable=0)\n");
+        pr_warn("anchr: Use YAML configuration for policy updates\n");
+    } else {
+        pr_warn("anchr: ===== SECURITY WARNING =====");
+        pr_warn("anchr: Policy files are WRITABLE at runtime");
+        pr_warn("anchr: Compromised processes with root access can tamper with policies");
+        pr_warn("anchr: Recommended: Set securityfs_policy_writable=0 in production");
+        pr_warn("anchr: ============================");
+    }
+
+    pr_info("anchr: Created global policy interface at /sys/kernel/security/anchr/policy (mode: %o)\n", mode);
+    return 0;
+}
+
+/**
+ * remove_global_policy_securityfs - Remove global policy file
+ */
+void remove_global_policy_securityfs(void)
+{
+    if (policy_apply_file) {
+        securityfs_remove(policy_apply_file);
+        policy_apply_file = NULL;
+    }
+    if (policy_map_file) {
+        securityfs_remove(policy_map_file);
+        policy_map_file = NULL;
+    }
+
+    if (global_policy_file && !IS_ERR(global_policy_file)) {
+        securityfs_remove(global_policy_file);
+        global_policy_file = NULL;
+    }
+}
+
+static struct dentry *global_policy_changes_file = NULL;
+
+/**
+ * create_global_policy_changes_securityfs - Create global policy_changes file
+ * @parent_dir: Parent securityfs directory (anchr root)
+ *
+ * Creates /sys/kernel/security/anchr/policy_changes for global policy change history.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+int create_global_policy_changes_securityfs(struct dentry *parent_dir)
+{
+    if (!parent_dir)
+        return -EINVAL;
+
+    global_policy_changes_file = securityfs_create_file("policy_changes", 0444, parent_dir,
+                                                         NULL, &global_policy_changes_fops);
+    if (IS_ERR(global_policy_changes_file)) {
+        pr_err("anchr: Failed to create global policy_changes file: %ld\n",
+               PTR_ERR(global_policy_changes_file));
+        return PTR_ERR(global_policy_changes_file);
+    }
+
+    pr_info("anchr: Created global policy_changes interface at /sys/kernel/security/anchr/policy_changes\n");
+    return 0;
+}
+
+/**
+ * remove_global_policy_changes_securityfs - Remove global policy_changes file
+ */
+void remove_global_policy_changes_securityfs(void)
+{
+    if (global_policy_changes_file && !IS_ERR(global_policy_changes_file)) {
+        securityfs_remove(global_policy_changes_file);
+        global_policy_changes_file = NULL;
+    }
+}

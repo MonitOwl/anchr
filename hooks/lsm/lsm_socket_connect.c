@@ -1,0 +1,180 @@
+#include "../hook_utils.h"
+#include "../../utils/utils.h"
+
+char LICENSE[] SEC("license") = "GPL";
+
+/* Helper for byte order conversion */
+#define bpf_ntohs(x) __builtin_bswap16(x)
+
+/*
+ * LSM hook: socket_connect
+ *
+ * Socket Connection Monitoring with IMA Measurement Flow
+ *
+ * @param sock: Pointer to the socket structure
+ * @param address: Pointer to the sockaddr structure containing remote address
+ * @param addrlen: Length of the address structure
+ */
+SEC("lsm.s/socket_connect")
+int BPF_PROG(bpf_socket_connect, struct socket *sock, struct sockaddr *address, int addrlen, int previous_ret)
+{
+    if (previous_ret != 0)
+        return previous_ret;
+
+    if (!address)
+        return 0;
+    if (address->sa_family != AF_INET && address->sa_family != AF_UNIX)
+        return 0;
+    /* Get the current task context */
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+    if (!task) {
+        bpf_printk("bpf_socket_connect: Failed to get current task.\n");
+        return 0;
+    }
+
+    /* Retrieve or create the task-local storage for this thread */
+    struct scratch_t *scratch = bpf_task_storage_get(&scratch_buf_map,
+                                                     task,
+                                                     0,
+                                                     BPF_LOCAL_STORAGE_GET_F_CREATE);
+    if (!scratch) {
+        bpf_printk("bpf_socket_connect: Failed to get task storage buffer.\n");
+        return 0;
+    }
+
+    /*
+     * Task storage persists across system calls for the same thread.
+     * A shorter dependency string may leave garbage characters
+     * from a previous connection at the end of the buddwe
+     */
+    __builtin_memset(scratch->buf, 0, sizeof(scratch->buf));
+
+    u64 total_time = 0, deps_time = 0;
+    u64 get_config_time = 0, filtering_time = 0, measure_time = 0;
+    u64 extend_time = 0;
+
+    total_time = bpf_ktime_get_ns();
+    struct sock *sk = BPF_CORE_READ(sock, sk);
+    if (!sk)
+        return 0;
+
+    u32 saddr = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
+    u16 sport = BPF_CORE_READ(sk, __sk_common.skc_num);
+
+    struct sockaddr_in *address_in = (struct sockaddr_in *)address;
+    u32 daddr = BPF_CORE_READ(address_in, sin_addr.s_addr);
+    u16 dport = BPF_CORE_READ(address_in, sin_port);
+
+    char additional_data[MAX_DATA_BUF_SIZE] = {0};
+    struct socket_addr_info addr_info = {
+        .additional_data = additional_data,
+        .buf_size = MAX_DATA_BUF_SIZE,
+        .saddr = saddr,
+        .daddr = daddr,
+        .sport = sport,
+        .dport = bpf_ntohs(dport),
+    };
+    long len = build_socket_additional_data(&addr_info);
+
+    /* bpf_snprintf returns the length including the trailing NUL, which is not
+     * part of the measured data: the verifiers recompute the template hash from
+     * the measurement line, where the NUL does not appear */
+    int buffer_len = 0;
+    if (len > 0) {
+        buffer_len = (len > MAX_DATA_BUF_SIZE) ? (MAX_DATA_BUF_SIZE - 1) : (int)(len - 1);
+        additional_data[buffer_len] = '\0';
+    }
+
+    char socket_path[MAX_PATH_LEN] = {0};
+    if (address->sa_family == AF_INET) {
+        struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+        if (!task)
+            return 0;
+        struct file *exe_file = bpf_get_task_exe_file(task);
+        if (!exe_file)
+            return 0;
+        bpf_d_path((struct path *)&exe_file->f_path, socket_path, sizeof(socket_path));
+        bpf_put_file(exe_file);
+    } else if (address->sa_family == AF_UNIX) {
+        struct sockaddr_un *un_addr = (struct sockaddr_un *)address;
+        int path_len = (addrlen - sizeof(unsigned short)) & PATH_LEN_MASK;
+        if (path_len > 0 && path_len < sizeof(socket_path)) {
+            bpf_probe_read_kernel(socket_path, path_len, un_addr->sun_path);
+            socket_path[path_len] = '\0';
+        }
+    }
+
+    struct task_struct *cur = (struct task_struct *)bpf_get_current_task();
+    get_config_time = bpf_ktime_get_ns();
+    int decision = anchr_policy_for_hook(HOOK_LSM_SOCKET_CONNECT, socket_path, 0, 0);
+    if (decision)
+        return decision < 0 ? decision : 0;
+    struct anchr_policy_config *policy = anchr_get_policy();
+    const char *cgroup_name = anchr_current_namespace();
+    bool is_container_context = true;
+    get_config_time = bpf_ktime_get_ns() - get_config_time;
+
+    char *deps = scratch->buf;
+    deps[0] = '\0';
+    int deps_max = sizeof(scratch->buf);
+    int deps_actual = 0;
+
+    if (!policy || (policy->action_flags & POLICY_ACTION_BUILD_DEPS)) {
+        deps_time = bpf_ktime_get_ns();
+        deps_actual = build_dependencies(deps, deps_max, socket_path, cur, policy ? policy->max_path_depth : 32);
+        deps_time = bpf_ktime_get_ns() - deps_time;
+    }
+
+    char event_name[] = "socket_connect";
+    struct socket_measure_ctx smctx = {
+        .event_name = event_name,
+        .cgroup_name = cgroup_name,
+        .is_container_context = is_container_context,
+        .deps = deps,
+        .deps_actual = deps_actual,
+        .deps_max = deps_max,
+        .additional_data = additional_data,
+        .additional_data_len = buffer_len,
+        .extend_duration = &extend_time,
+    };
+
+    measure_time = bpf_ktime_get_ns();
+    int ret = measure_socket_data(&smctx);
+    measure_time = bpf_ktime_get_ns() - measure_time;
+
+    if (ret < 0)
+        return ret;
+
+
+    total_time = bpf_ktime_get_ns() - total_time;
+
+    u32 stats_key = TIMING_SOCKET;
+    u64 *count = bpf_map_lookup_elem(&bpf_timing_stats_count, &stats_key);
+    if (count) {
+        u64 current_index =__sync_fetch_and_add(count, 1);
+        if (current_index < TIMING_MAX_ENTRIES) {
+            u32 index_key = (u32)current_index;
+            struct hook_timing *timing = bpf_map_lookup_elem(&bpf_timing_stats_socket, &index_key);
+            if (timing) {
+                __sync_fetch_and_add(&timing->total_time, total_time);
+                if (deps_time > 0)
+                    __sync_fetch_and_add(&timing->deps_time, deps_time);
+                if (measure_time > 0)
+                    __sync_fetch_and_add(&timing->measure_time, measure_time);
+                __sync_fetch_and_add(&timing->extend_time, extend_time);
+                __sync_fetch_and_add(&timing->get_config_time, get_config_time);
+                __sync_fetch_and_add(&timing->filtering_time, filtering_time);
+
+                if (address->sa_family == AF_INET) {
+                    __builtin_memcpy(timing->binary_name, additional_data, TIMING_MAX_BUF);
+                } else if (address->sa_family == AF_UNIX) {
+                    __builtin_memcpy(timing->binary_name, socket_path, TIMING_MAX_BUF);
+                }
+                // Ensure null termination if the string was cut
+                timing->binary_name[TIMING_MAX_BUF - 1] = '\0';
+            }
+        }
+    }
+
+    return 0;
+}
