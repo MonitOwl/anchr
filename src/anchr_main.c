@@ -292,7 +292,7 @@ module_init(anchr_init);
 module_exit(anchr_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("TORSEC");
+MODULE_AUTHOR("MonitOwl");
 MODULE_DESCRIPTION("anchr: eBPF-enhanced Integrity Measurement Architecture with TPM integration");
 MODULE_VERSION("1.0");
 
