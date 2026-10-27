@@ -80,10 +80,11 @@ $(BUILD_DIR)/%.o: hooks/lsm/%.c hooks/hook_utils.h utils/utils.h utils/headers_b
 	$(CLANG) $(CFLAGS) -c $< -o $@
 	@echo "Built eBPF object: $@"
 
+# Kbuild's own clean is not used: it deletes every *.mod file, including go.mod.
 clean:
-	make -C $(KERNEL_SRC) M=$(PWD) clean
 	rm -rf $(BUILD_DIR)
-	rm -f .*.cmd .*.o 2>/dev/null || true
+	rm -f anchr.ko anchr.mod anchr.mod.c anchr.o Module.symvers modules.order
+	rm -f src/*.o src/.*.cmd .*.cmd .*.o 2>/dev/null || true
 	rm -rf .tmp_versions 2>/dev/null || true
 
 $(BUILD_DIR)/kfunc-buffer-test: tests/security/kfunc_buffer_test.c include/anchr_kfunc_buffer.h include/anchr_kfunc_types.h | $(BUILD_DIR)
