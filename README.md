@@ -447,4 +447,4 @@ anchr originated from research carried out within TORSEC, the cybersecurity rese
 
 # License
 
-This project is open-source software distributed under the terms of the GNU General Public License version 2 (GPLv2).
+This project is open-source software distributed under the terms of the GNU General Public License version 2 (GPLv2). See [LICENSE](LICENSE) for the full text.
