@@ -35,11 +35,13 @@ anchr/
 ## Components
 
 ### eBPF Hooks
-- `lsm_container_events.c` - Container lifecycle tracking
-- `lsm_bprm_check_security.c` - Process execution monitoring (policy-enabled)
-- `lsm_file_open.c` / `lsm_file_post_open.c` - File access monitoring (policy-enabled)
+- `lsm_bprm_check_security.c` - Process execution monitoring and container detection
+- `lsm_file_post_open.c` - File access monitoring
+- `lsm_inode_setattr.c` - File attribute change monitoring
 - `lsm_mmap_file.c` - Memory-mapped file monitoring
 - `lsm_socket_connect.c` - Network connection monitoring
+
+All hooks are policy-enabled.
 
 ### Kernel Module
 The module provides custom BPF kfuncs and manages:
@@ -139,7 +141,7 @@ for requirements, coverage, cleanup behavior, and report locations.
 
 ### Kfunc interface
 
-Every kfunc memory argument now has an adjacent size argument checked by the BPF
+Every kfunc memory argument has an adjacent size argument checked by the BPF
 verifier. String inputs must be NUL-terminated within the supplied extent. The
 measurement API accepts a pointer-free `struct anchr_measurement_request` and
 `sizeof(request)`. Its event name is required, an empty namespace selects
@@ -148,10 +150,9 @@ measurement API accepts a pointer-free `struct anchr_measurement_request` and
 functions return `false` for invalid inputs.
 
 The shared request and policy layouts are declared in
-`include/anchr_kfunc_types.h`. Rebuild the module, BPF programs, and userspace
-tool together after this API change. Reload the hooks and recreate their pinned
-maps: the policy value is now 36 bytes and the scratch value has grown to hold
-the bounded measurement request.
+`include/anchr_kfunc_types.h`. The module, BPF programs, and userspace tool
+share these layouts, so build them together from the same revision; when
+upgrading, reload the hooks and recreate their pinned maps.
 
 ### Manual
 
@@ -178,8 +179,6 @@ sudo cat /sys/kernel/security/anchr/status
 sudo ./build/anchr-tool unload
 sudo rmmod anchr
 ```
-
-**Note 1:** The unified `anchr-tool` replaces the old separate `loader` and `policy_init` utilities.
 
 ## Module Parameters
 
