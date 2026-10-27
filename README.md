@@ -441,6 +441,10 @@ sudo bpftool prog list
 sudo cat /sys/kernel/debug/tracing/trace
 ```
 
+# Acknowledgments
+
+anchr originated from research carried out within TORSEC, the cybersecurity research group of Politecnico di Torino, by current and former members of the group who remain its authors.
+
 # License
 
 This project is open-source software distributed under the terms of the GNU General Public License version 2 (GPLv2).
