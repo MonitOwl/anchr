@@ -305,13 +305,13 @@ int BPF_PROG(lsm_bprm_check_security, struct linux_binprm *bprm, int ret)
 
 ### C. Userspace Tools
 
-**1. anchr-tool** (NEW - unified management)
+**1. anchr-tool** (unified management)
    - **Location**: `tools/anchr_tool.c`
    - **Commands**:
      - `load <bpf_obj> [-d]`: Load and attach eBPF program
      - `unload`: Stop and detach programs
      - `policy-init`: Initialize policy maps with defaults
-     - `policy-update <yaml>`: Update policy from config (TODO: YAML parsing)
+     - `policy-update <yaml>`: Update policy from a YAML config
      - `status`: Show system status
 
 **2. Test Infrastructure**

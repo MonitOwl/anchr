@@ -6,7 +6,7 @@ eBPF-based integrity monitoring system with container tracking, Merkle tree veri
 
 This system monitors file operations and container events using eBPF LSM and kprobe hooks. Measurements are organized per-container in a Merkle tree structure, with the root hash extended to a configurable TPM PCR (default: PCR 23) for hardware-backed attestation.
 
-**NEW:** Policy-based configuration system allows fine-grained control over what gets measured, filtered, and how events are processed - configured via BPF maps and enforced at the kernel level.
+Policy-based configuration system allows fine-grained control over what gets measured, filtered, and how events are processed - configured via BPF maps and enforced at the kernel level.
 
 ## Directory Structure
 
@@ -69,13 +69,19 @@ Unified userspace tool that handles:
 ## Build
 
 Requirements:
-- Linux kernel 5.8+ with BPF LSM enabled
-- clang, llvm, libbpf-devel, elfutils-libelf-devel, zlib-devel
+- Linux kernel 6.13+ (the module imports the `BPF_INTERNAL` symbol namespace with the
+  syntax introduced in 6.13; the hooks also rely on the `file_post_open` LSM hook (6.11)
+  and the `bpf_get_task_exe_file` kfunc (6.12))
+- Kernel configuration: `CONFIG_BPF_LSM=y` with `bpf` in the active LSM list (`lsm=` boot
+  parameter), `CONFIG_IMA=y` for `bpf_ima_file_hash`, `CONFIG_DEBUG_INFO_BTF=y` and
+  `CONFIG_DEBUG_INFO_BTF_MODULES=y`, `CONFIG_SECURITYFS=y`, and a TPM 2.0 for PCR extension
+- clang, llvm, bpftool
+- libbpf-devel, elfutils-libelf-devel, zlib-devel, libyaml-devel, openssl-devel
 - kernel-devel, kernel-debuginfo (for BTF)
 
 ```bash
 # Install dependencies (Fedora)
-sudo dnf install kernel-devel libbpf-devel elfutils-libelf-devel zlib-devel clang llvm libyaml-devel
+sudo dnf install kernel-devel libbpf-devel elfutils-libelf-devel zlib-devel libyaml-devel openssl-devel clang llvm bpftool
 sudo dnf debuginfo-install kernel
 
 # Build

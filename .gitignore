@@ -7,6 +7,8 @@ build/
 *.o
 *.mod
 !go.mod
+Module.symvers
+modules.order
 
 # Kernel build system files (in case they end up in root)
 *.cmd

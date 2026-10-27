@@ -44,7 +44,7 @@ first; the runner does not compile programs as root.
 
 ## Host requirements
 
-- Kernel headers and a module built for the running kernel.
+- Linux kernel 6.13 or newer, with its headers and a module built for it.
 - BPF LSM enabled in both the kernel configuration and the active LSM list at
   `/sys/kernel/security/lsm`.
 - Kernel BTF at `/sys/kernel/btf/vmlinux` and module BTF at
