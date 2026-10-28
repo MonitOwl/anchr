@@ -172,8 +172,9 @@ sudo ./build/anchr-tool policy-init
 # 4. Check status
 sudo ./build/anchr-tool status
 
-# 5. View measurements
+# 5. View status and the namespace's measurements
 sudo cat /sys/kernel/security/anchr/status
+sudo cat /sys/kernel/security/anchr/namespaces/<namespace-id>/measurements
 
 # Cleanup
 sudo ./build/anchr-tool unload
@@ -204,23 +205,26 @@ echo 15 | sudo tee /sys/module/anchr/parameters/tpm_pcr_index
 **Note:** PCR 0-15 are typically reserved for BIOS/bootloader. PCR 16-23 are available for OS and application use.
 
 ## SecurityFS Interface
-
 ```
 /sys/kernel/security/anchr/
-├── merkle_root              # Current Merkle tree root hash
-├── measurements             # Global measurement list
+├── merkle_root_history      # Current Merkle tree root hash
 ├── status                   # Module status and configuration
-├── container_list           # Tracked containers
-└── containers/
-    └── <container_id>/
-        └── measurements     # Per-container measurements
+├── policy                   # Global policy
+├── policy_apply             # Policy transaction endpoint
+├── policy_changes           # Global policy change history
+├── policy_map               # Policy-map binding endpoint
+└── namespaces/
+    └── <cgroup-derived-namespace>/
+        ├── measurements     # This namespace's measurement list
+        ├── policy           # Namespace policy extension, when created
+        └── policy_changes   # Namespace policy audit history, when created
 ```
 
 Read example:
 ```bash
-cat /sys/kernel/security/anchr/merkle_root
+cat /sys/kernel/security/anchr/merkle_root_history
 cat /sys/kernel/security/anchr/status
-cat /sys/kernel/security/anchr/containers/*/measurements
+cat /sys/kernel/security/anchr/namespaces/<cgroup-derived-namespace>/measurements
 ```
 
 ## Policy Configuration
