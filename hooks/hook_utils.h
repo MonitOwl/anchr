@@ -157,12 +157,16 @@ static __attribute__((noinline, unused)) int anchr_submit_measurement(struct mea
         request->flags = ANCHR_MEASUREMENT_HAS_DEPENDENCIES;
     }
 
-    if (ctx->additional_data_len &&
-        bpf_probe_read_kernel(request->additional_data, ctx->additional_data_len,
-                              ctx->additional_data))
+    int data_len = ctx->additional_data_len;
+    const char *data = ctx->additional_data;
+    if (data_len < 0 || data_len >= sizeof(request->additional_data) ||
+        (!data && data_len))
         return -1;
 
-    request->additional_data_len = ctx->additional_data_len;
+    if (data_len && bpf_probe_read_kernel(request->additional_data, data_len, data))
+        return -1;
+
+    request->additional_data_len = data_len;
     return anchr_measurement_extend(request, sizeof(*request));
 }
 
