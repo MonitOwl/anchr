@@ -58,7 +58,8 @@ int BPF_PROG(lsm_bprm_check_security, struct linux_binprm *bprm, int previous_re
     int decision = anchr_policy_for_hook(HOOK_LSM_BPRM_CHECK_SECURITY, debug_fname, size,
                                          ANCHR_POLICY_FILE | ANCHR_POLICY_READONLY | ANCHR_POLICY_EXECUTABLE);
     if (decision)
-        return decision < 0 ? decision : 0;
+        return (decision < -4095) ? -4095 : (decision > 0) ? 0 : (int)decision;
+
     struct anchr_policy_config *policy = anchr_get_policy();
     const char *cgroup_name = anchr_current_namespace();
     bool is_container_context = true;
@@ -101,10 +102,10 @@ int BPF_PROG(lsm_bprm_check_security, struct linux_binprm *bprm, int previous_re
     measure_time = bpf_ktime_get_ns() - measure_time;
 
     if (ret < 0) {
-        if (!policy || policy->log_level >= 1) {
+         if (!policy || policy->log_level >= 1) {
             bpf_printk("The file measurement failed: %d\n", ret);
         }
-        return ret;
+        return (ret < -4095) ? -4095 : (ret > 0) ? 0 : (int)ret;
     }
 
     total_time = bpf_ktime_get_ns() - total_time;
