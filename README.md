@@ -1,5 +1,7 @@
 # anchr
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/MonitOwl/anchr.svg)](https://pkg.go.dev/github.com/MonitOwl/anchr/verifier/pkg/verifier)
+
 eBPF-based integrity monitoring system with container tracking, Merkle tree verification, TPM integration, and **policy-based configuration**.
 
 ## Overview
@@ -55,11 +57,11 @@ The module provides custom BPF kfuncs and manages:
 Go library (`github.com/MonitOwl/anchr/verifier/pkg/...`) that replays the
 measurement lists exposed in SecurityFS and attests them against the Merkle
 leaf list and the TPM PCR value:
-- `measurement` - measurement entries and lists
-- `pcr` - software PCR used to replay extend sequences
-- `reader` - line readers over files or in-memory lists
-- `securityfs` - paths of the files exposed by the kernel module
-- `verifier` - attestation of a measurement list against the leaf list and PCR
+- [`measurement`](https://pkg.go.dev/github.com/MonitOwl/anchr/verifier/pkg/measurement) - measurement entries and lists
+- [`pcr`](https://pkg.go.dev/github.com/MonitOwl/anchr/verifier/pkg/pcr) - software PCR used to replay extend sequences
+- [`reader`](https://pkg.go.dev/github.com/MonitOwl/anchr/verifier/pkg/reader) - line readers over files or in-memory lists
+- [`securityfs`](https://pkg.go.dev/github.com/MonitOwl/anchr/verifier/pkg/securityfs) - paths of the files exposed by the kernel module, and lookup of a container's measurement list
+- [`verifier`](https://pkg.go.dev/github.com/MonitOwl/anchr/verifier/pkg/verifier) - attestation of a measurement list against the leaf list and PCR
 
 ### Management Tool (anchr-tool)
 Unified userspace tool that handles:
@@ -98,6 +100,48 @@ Output: `build/anchr.ko`, `build/anchr-tool`, `build/*.o`
 go test ./verifier/...
 ```
 
+To attest a container, find its measurement list from the container ID reported by the
+runtime (e.g. `docker inspect --format '{{.Id}}'`), then replay it against the Merkle root
+history and the PCR value read from the TPM. For remote attestation with a TPM quote, see
+[attestr](https://github.com/MonitOwl/attestr). The kernel module names a namespace after the
+cgroup of the container (e.g. `docker-<id>.scope`); `securityfs.FindContainerMeasurementList`
+strips the runtime prefix and suffix and matches the container ID.
+
+```go
+path, err := securityfs.FindContainerMeasurementList(containerID)
+if err != nil {
+	return err // wraps securityfs.ErrNoMeasurementList if the container was never measured
+}
+
+// The container list must be read before the PCR and the leaf list after it,
+// so that both are covered by the PCR value.
+containerList, err := os.ReadFile(path)
+if err != nil {
+	return err
+}
+pcrValue, err := readPCR() // PCR 23 of the SHA-256 bank, e.g. from a TPM quote
+if err != nil {
+	return err
+}
+leafList, err := os.ReadFile(securityfs.LeafListPath)
+if err != nil {
+	return err
+}
+
+target, err := measurement.NewHashedFileList(reader.FromBytes(containerList), crypto.SHA256)
+if err != nil {
+	return err
+}
+leaves, err := measurement.NewLeafList(reader.FromBytes(leafList), crypto.SHA256)
+if err != nil {
+	return err
+}
+v, err := verifier.New(target, leaves, pcrValue)
+if err != nil {
+	return err
+}
+return v.Attest()
+```
 
 ## Usage
 
